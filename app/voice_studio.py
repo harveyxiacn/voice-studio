@@ -90,6 +90,19 @@ def stream_task(fn, *args):
     yield "\n".join(logs[-300:]), result.get("msg", ""), progress_html(prog, done=True)
 
 
+def _queued(log, task):
+    """显卡正忙时排队（先来先到），在日志和进度条上显示排队位置，轮到了自动开始。"""
+    said = {"pos": None}
+
+    def on_wait(pos, cur):
+        if said["pos"] != pos:
+            said["pos"] = pos
+            log(f"⏳ 显卡正忙（{cur}），排队中：第 {pos} 位，轮到后自动开始")
+        log.progress(0.0, f"排队中：第 {pos} 位（等待「{cur}」完成）")
+
+    return gpu.use(task, on_wait=on_wait)
+
+
 def project_choices():
     return [(n, pid) for n, pid in core.list_projects()]
 
@@ -127,6 +140,8 @@ def status_html():
         chips.append(f"<span class='chip busy'>⏳ {st['task']}（{mins:.0f} 分钟）</span>")
     else:
         chips.append("<span class='chip'>✅ 空闲</span>")
+    if st["queue"]:
+        chips.append(f"<span class='chip busy'>🕒 排队 {len(st['queue'])} 个：{'、'.join(st['queue'][:3])}</span>")
     if st["apps"]:
         chips.append(f"<span class='chip warn'>⚠️ 检测到 {'、'.join(st['apps'])} 正在运行，训练前请关闭</span>")
     return "<div class='statusbar'>" + "".join(chips) + "</div>"
@@ -227,7 +242,7 @@ def do_direct(log, pid, files, lang, sep, dereverb):
         raise ValueError("请先在页面顶部选择或新建一个声音")
     if not files:
         raise ValueError("请先上传录音或视频文件")
-    with gpu.use("导入素材"):
+    with _queued(log, "导入素材"):
         ENG.release_all()
         gpu.check_free("识别处理")
         paths = _paths(files)
@@ -251,7 +266,7 @@ def on_analyze(files, lang, sep, dereverb, sens, num):
     def job(log):
         if not files:
             raise ValueError("没有收到文件：请先上传录音或视频。大文件上传需要一点时间，等文件名旁边显示出大小后再点。")
-        with gpu.use("识别说话人"):
+        with _queued(log, "识别说话人"):
             ENG.release_all()
             gpu.check_free("识别处理")
             paths = _paths(files)
@@ -313,7 +328,7 @@ def on_confirm_speakers(res, *vals):
     holder = {}
 
     def job(log):
-        with gpu.use("导入素材"):
+        with _queued(log, "导入素材"):
             ENG.release_all()
             holder["made"] = core.process_speakers(res, assign, log)
         names_done = [core.load_project(p)["name"] for p in holder["made"]]
@@ -592,7 +607,7 @@ def do_zero_shot(log, pid):
         raise ValueError("请先选择一个声音")
     meta = core.build_voice(core.load_project(pid))
     log(f"✅ 语音包已更新：{meta['name']}（参考录音 {len(meta['refs'])} 条）")
-    with gpu.use("更新声纹"):
+    with _queued(log, "更新声纹"):
         core.update_voiceprint(pid, log)
     return "✅ 语音包已生成 / 更新，三个引擎都可以直接用了。到「④ 文字转语音」试听。"
 
@@ -622,7 +637,7 @@ def _sample_take(engine, pid, use_lora, log):
 
 def do_train_vox(log, pid, iters, holder):
     proj = _pre_train(log, pid)
-    with gpu.use("VoxCPM2 微调"):
+    with _queued(log, "VoxCPM2 微调"):
         ENG.release_all()
         gpu.check_free("VoxCPM2 微调")
         t0 = time.time()
@@ -638,7 +653,7 @@ def do_train_vox(log, pid, iters, holder):
 
 def do_train_gsv(log, pid, e_sovits, e_gpt, bs, holder):
     proj = _pre_train(log, pid)
-    with gpu.use("GPT-SoVITS 训练"):
+    with _queued(log, "GPT-SoVITS 训练"):
         ENG.release_all()
         gpu.check_free("GPT-SoVITS 训练")
         t0 = time.time()
@@ -698,7 +713,11 @@ def voice_info(vid):
         cnt[key] = cnt.get(key, 0) + 1
     st = [f"VoxCPM2：{'✅ 已微调' if v.get('voxcpm_lora') else '零样本'}", "CosyVoice3：零样本",
           f"GPT-SoVITS：{'✅ 已训练' if v['trained'] else '零样本（粤语易漏字，建议先训练）'}"]
-    return (f"**{v['name']}**　" + "　|　".join(st) + "\n\n情感参考录音：" + "、".join(f"{k}×{n}" for k, n in cnt.items()))
+    pins = v.get("pinned") or {}
+    pin_txt = ("\n\n📌 已锁定参考录音：" + "、".join(f"{core.LANG_NAMES.get(k.split('|')[0], k)}·{k.split('|')[1]}" for k in pins)
+               if pins else "")
+    return (f"**{v['name']}**　" + "　|　".join(st) + "\n\n情感参考录音：" + "、".join(f"{k}×{n}" for k, n in cnt.items())
+            + pin_txt)
 
 
 def _params(tlang, emo, auto, expr, speed, pause, seed, multi, strong, use_lora):
@@ -729,7 +748,7 @@ def on_synth(engine, vid, text, *pv):
     holder = {}
 
     def job(log):
-        with gpu.use(f"生成语音（{engine}）"):
+        with _queued(log, f"生成语音（{engine}）"):
             holder["meta"] = takes.create(engine, vid, text, params, log)
         return "ok"
 
@@ -775,6 +794,71 @@ def on_regen(tid, idx, text, emo, use_edit):
     s = m["sentences"][int(idx)]
     out = _take_outputs(m, note=f"🔁 第 {int(idx) + 1} 句已重做（种子 {s['seed']}），整段音频和字幕已同步更新。")
     return out + (takes.sentence_path(m, int(idx)), s["text"], s["emotion"])
+
+
+def on_pin(tid, idx):
+    """把选中句子用到的参考录音锁定为该语言+情感的默认参考。"""
+    if tid is None or idx is None:
+        raise gr.Error("请先在表格里点选一句")
+    m = takes.load(tid)
+    s = m["sentences"][int(idx)]
+    if not s.get("ref"):
+        raise gr.Error("这句没有记录参考录音（GPT-SoVITS 或旧版本生成的），请用其他引擎重做后再锁定")
+    lang = takes._lang(m)
+    core.pin_ref(m["vid"], lang, s["emotion"], s["ref"])
+    return (f"📌 已锁定：「{m['voice_name']}」以后生成 **{core.LANG_NAMES.get(lang, lang)}·{s['emotion']}** 的句子，"
+            f"都用这句的参考录音（`{s['ref']}`）。随机种子仍会带来细微变化。"), voice_info(m["vid"])
+
+
+def on_cands(tid, idx, text, emo):
+    if tid is None or idx is None:
+        raise gr.Error("请先在表格里点选一句")
+    try:
+        with gpu.use("生成候选"):
+            paths = takes.candidates(tid, int(idx), 3, text, emo)
+    except gpu.GpuBusy as e:
+        raise gr.Error(str(e))
+    except Exception as e:
+        traceback.print_exc()
+        raise gr.Error(f"生成候选失败：{e}")
+    return [gr.update(visible=True)] + paths + [f"🎲 第 {int(idx) + 1} 句的 3 个候选已生成，逐个听，点最像的那个下面的「用这个」。"]
+
+
+def make_choose(k):
+    def f(tid, idx):
+        if tid is None or idx is None:
+            raise gr.Error("请先在表格里点选一句")
+        try:
+            m = takes.choose(tid, int(idx), k)
+        except ValueError as e:
+            raise gr.Error(str(e))
+        s = m["sentences"][int(idx)]
+        out = _take_outputs(m, note=f"✅ 第 {int(idx) + 1} 句已换成候选 {k + 1}（种子 {s['seed']}），整段音频和字幕已更新。"
+                                    "觉得它最像的话，可以再点「📌 锁定」。")
+        return out + (takes.sentence_path(m, int(idx)), s["text"], s["emotion"], gr.update(visible=False))
+    return f
+
+
+def on_unpin(vid):
+    if not vid:
+        raise gr.Error("请先选择语音包")
+    core.unpin_all(vid)
+    return voice_info(vid)
+
+
+def on_tlang_change(tlang, engine):
+    """粤语只推荐 VoxCPM2：CosyVoice3 / Qwen3-TTS 的粤语被评为「塑料粤语」口音。"""
+    if "yue" in TEXT_LANGS.get(tlang, "") and engine in ("CosyVoice3", "Qwen3-TTS") and "VoxCPM2" in ENG.available():
+        gr.Info(f"粤语已切换到 VoxCPM2（{engine} 的粤语口音不地道）")
+        return gr.update(value="VoxCPM2")
+    return gr.update()
+
+
+def on_save_dict(rows):
+    import textnorm
+    data = rows.values.tolist() if hasattr(rows, "values") else rows
+    n = textnorm.save_rows(data)
+    return f"✅ 发音词典已保存（{n} 条），之后生成和重做都会生效。", textnorm.dict_rows() or [["", "", "粤语"]]
 
 
 def on_delete_take(tid):
@@ -861,6 +945,7 @@ def play_render(folder, kw, order, page):
     page = int(min(max(1, page or 1), pages))
     cur = files[(page - 1) * PLAY_PAGE: page * PLAY_PAGE]
     sc = _load_scores(folder) if folder else {}
+    auto = _load_auto(folder) if folder else {}
     outs = []
     for k in range(PLAY_PAGE):
         if k < len(cur):
@@ -870,9 +955,9 @@ def play_render(folder, kw, order, page):
             s = sc.get(f, {})
             tag = "🎙️ 原始录音　" if not f.lower().endswith(".wav") or "人声" in f else ""
             title = f"**{f}**　{tag}{f'{d:.1f} 秒' if d else ''}　{time.strftime('%m-%d %H:%M', time.localtime(os.path.getmtime(p)))}"
-            outs += [gr.update(visible=True), title, p, s.get("score", "未评"), s.get("note", "")]
+            outs += [gr.update(visible=True), title, p, s.get("score", "未评"), s.get("note", ""), _auto_md(auto.get(f))]
         else:
-            outs += [gr.update(visible=False), "", None, "未评", ""]
+            outs += [gr.update(visible=False), "", None, "未评", "", ""]
     info = f"共 {len(files)} 个音频，第 {page}/{pages} 页" if folder else "请选择文件夹"
     return [page, cur, info] + outs + [play_ranking(folder)]
 
@@ -885,6 +970,75 @@ def play_ranking(folder):
         return "还没有评分。听完给每个打星，点「💾 保存本页评分」，这里会按星级排名。"
     rows = ["| 评分 | 文件 | 备注 |", "|---|---|---|"] + [f"| {s} | {f} | {n} |" for s, f, n in rated]
     return "**评分排名**\n\n" + "\n".join(rows)
+
+
+AUTO_FILE = "自动评分.json"
+
+
+def _load_auto(folder):
+    try:
+        with open(os.path.join(folder, AUTO_FILE), encoding="utf-8") as f:
+            return __import__("json").load(f)
+    except Exception:
+        return {}
+
+
+def _auto_md(r):
+    if not r:
+        return ""
+    sub = "　".join(f"{k} {v}" for k, v in r["sub"].items() if not k.startswith("_"))
+    warn = [f for f in r["flags"] if not f.startswith("ℹ️")]
+    info = [f for f in r["flags"] if f.startswith("ℹ️")]
+    return (f"🤖 **参考 {r['stars']}⭐**（{r['score']} 分）　{sub}"
+            + ("\n\n⚠️ " + "；".join(warn) if warn else "\n\n✅ 没发现明显问题")
+            + ("\n\n" + "；".join(info) if info else "")
+            + ("" if r.get("has_text") else "\n\nℹ️ 找不到原文，没评准确度"))
+
+
+def play_auto(folder, cur):
+    """自动评分本页（只评 wav；结果缓存到该文件夹的 自动评分.json）。"""
+    import json
+    import autoscore
+    if not folder or not cur:
+        raise gr.Error("这一页没有音频")
+    wavs = [os.path.join(folder, f) for f in cur if f.lower().endswith(".wav") and "人声" not in f]
+    if not wavs:
+        raise gr.Error("这一页没有生成的 wav 音频")
+    try:
+        with _queued_sync("自动评分"):
+            res = autoscore.evaluate(wavs, log=print)
+    except gpu.GpuBusy as e:
+        raise gr.Error(str(e))
+    auto = _load_auto(folder)
+    for r in res:
+        auto[os.path.basename(r["wav"])] = r
+    with open(os.path.join(folder, AUTO_FILE), "w", encoding="utf-8") as f:
+        json.dump(auto, f, ensure_ascii=False, indent=1)
+    return [_auto_md(auto.get(f)) if k < len(cur) and (f := cur[k]) else "" for k in range(PLAY_PAGE)] + \
+        ["🤖 自动评分只是参考：它能可靠地发现漏读、读错（含数字读法）、明显的长停顿和音色差距过大；"
+         "判断不了口音和「语气像不像」。实测与人工评分的秩相关约 0.5。"]
+
+
+def play_calibrate():
+    """汇总所有文件夹里「人工星级 + 自动评分」，校准综合分权重。"""
+    import json
+    import autoscore
+    samples = []
+    for _, folder in play_folders():
+        sc, auto = _load_scores(folder), _load_auto(folder)
+        for f, v in sc.items():
+            if f in auto and v.get("score", "未评") != "未评":
+                samples.append((auto[f]["sub"], int(v["score"][-1])))
+    w, rep = autoscore.calibrate(samples)
+    if w:
+        with open(os.path.join(core.WORK, "_score_weights.json"), "w", encoding="utf-8") as f:
+            json.dump({"weights": w, "report": rep, "n": len(samples), "time": time.strftime("%Y-%m-%d %H:%M")}, f,
+                      ensure_ascii=False, indent=1)
+    return "📐 " + rep + (f"\n\n新权重：" + "　".join(f"{k} {v:.2f}" for k, v in w.items()) if w else "")
+
+
+def _queued_sync(task):
+    return gpu.use(task)
 
 
 def play_save(folder, cur, *vals):
@@ -1006,6 +1160,7 @@ CSS = """
 .line {font-size:28px; line-height:1.5; font-weight:600; margin:6px 0 10px}
 .tip {font-size:14px; opacity:.85}
 .recprog {font-size:14px; line-height:2}
+.auto-md {font-size:13px}
 .hidden-b64 {display:none !important}
 .recorder {padding:12px; border:1px solid var(--border-color-primary); border-radius:10px}
 .rbtn {padding:8px 18px; border-radius:8px; font-size:16px; font-weight:600; margin-right:8px; cursor:pointer;
@@ -1055,6 +1210,7 @@ def build_ui():
                 status = gr.HTML(status_html(), elem_id="statusbar")
             with gr.Column(scale=1, min_width=120):
                 release_btn = gr.Button("🧹 释放显存", size="sm")
+                cancel_q_btn = gr.Button("取消排队", size="sm")
         with gr.Row(equal_height=False):
             sel_proj = gr.Dropdown(project_choices(), label="当前声音", scale=3)
             new_name = gr.Textbox(label="新建声音", placeholder="写个名字，例如：我的声音", scale=3)
@@ -1193,7 +1349,11 @@ def build_ui():
                 voice = gr.Dropdown(voice_choices(), label="语音包", scale=5)
                 with gr.Column(scale=1, min_width=90):
                     refresh = gr.Button("🔄 刷新", size="sm")
-            vinfo = gr.Markdown("请选择语音包。")
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=6):
+                    vinfo = gr.Markdown("请选择语音包。")
+                with gr.Column(scale=1, min_width=120):
+                    unpin_btn = gr.Button("清除锁定", size="sm")
             with gr.Row():
                 with gr.Column(scale=3):
                     text = gr.Textbox(label="文案", lines=8,
@@ -1239,6 +1399,26 @@ def build_ui():
                         with gr.Row():
                             regen_btn = gr.Button("🔁 换个语气重做（文字不变）")
                             regen_edit_btn = gr.Button("✏️ 按修改重做", variant="primary")
+                        with gr.Row():
+                            cand_btn = gr.Button("🎲 生成 3 个候选（听了再选）")
+                            pin_btn = gr.Button("📌 这句最像：锁定它的参考录音")
+                with gr.Group(visible=False) as cand_group:
+                    gr.Markdown("**候选试听**：同一句话、不同随机性。机器判断不了「像不像」（声纹分数和人耳评分几乎不相关），请用耳朵挑。")
+                    with gr.Row():
+                        cand_audios, cand_picks = [], []
+                        for k in range(3):
+                            with gr.Column():
+                                cand_audios.append(gr.Audio(label=f"候选 {k + 1}", type="filepath", interactive=False))
+                                cand_picks.append(gr.Button(f"✅ 用候选 {k + 1}", size="sm"))
+            with gr.Accordion("📖 发音词典（纠正读音：用同音字替换，字幕仍显示原文）", open=False):
+                gr.Markdown("某个词总读错时，在这里写一个**读音正确的同音写法**。例如粤语「珊姐」的「姐」要读上扬调，可以试「珊者」；"
+                            "改完点保存，再对那句点「🔁 重做」试听。数字规则已内置：年份逐位读（2026 → 二零二六），长数字逐位读。")
+                import textnorm
+                pron = gr.Dataframe(headers=["原文", "读成（同音写法）", "语言"], value=textnorm.dict_rows() or [["", "", "粤语"]],
+                                    datatype=["str", "str", "str"], interactive=True, col_count=(3, "fixed"), row_count=(1, "dynamic"))
+                with gr.Row():
+                    pron_save = gr.Button("💾 保存发音词典", variant="primary")
+                    pron_msg = gr.Markdown("语言填：粤语 / 普通话 / 全部")
             with gr.Accordion("🎧 对比试听结果", open=False) as cmp_acc:
                 cmp_outs = []
                 with gr.Row():
@@ -1262,7 +1442,7 @@ def build_ui():
                 pl_next = gr.Button("下一页 ▶", size="sm")
             pl_info = gr.Markdown()
             pl_cur = gr.State([])
-            pl_groups, pl_titles, pl_audios, pl_scores, pl_notes = [], [], [], [], []
+            pl_groups, pl_titles, pl_audios, pl_scores, pl_notes, pl_autos = [], [], [], [], [], []
             for r in range(PLAY_PAGE // 2):
                 with gr.Row():
                     for c in range(2):
@@ -1272,8 +1452,13 @@ def build_ui():
                             with gr.Row():
                                 pl_scores.append(gr.Dropdown(SCORES, value="未评", show_label=False, container=False, min_width=110))
                                 pl_notes.append(gr.Textbox(show_label=False, container=False, placeholder="备注：像不像、口音、哪里不对…"))
+                            pl_autos.append(gr.Markdown(elem_classes="auto-md"))
                         pl_groups.append(g)
-            pl_save = gr.Button("💾 保存本页评分", variant="primary")
+            with gr.Row():
+                pl_save = gr.Button("💾 保存本页评分", variant="primary")
+                pl_auto_btn = gr.Button("🤖 自动评分本页（参考）")
+                pl_cal_btn = gr.Button("📐 用我的评分校准自动评分")
+            pl_auto_msg = gr.Markdown()
             pl_rank = gr.Markdown()
 
         # ---------------- ⑤ 管理
@@ -1318,6 +1503,7 @@ def build_ui():
         # 顶部
         timer.tick(status_html, None, [status], show_progress="hidden")
         release_btn.click(on_release, None, [status])
+        cancel_q_btn.click(lambda: (gpu.cancel(), gr.Info("已取消本网页里排队中的任务"), status_html())[-1], None, [status])
         open_btn.click(on_open_project, [new_name, sel_proj], [sel_proj, pid_state, new_name])
         sel_proj.select(lambda s: s, [sel_proj], [pid_state])
         pid_state.change(checklist_html, [pid_state], [checklist]) \
@@ -1388,6 +1574,13 @@ def build_ui():
         regen_outs = [out_audio, srt_file, out_md, sent_table, hist, sent_audio, sent_text, sent_emo]
         regen_btn.click(lambda t, i, x, e: on_regen(t, i, x, e, False), [take_state, sent_idx, sent_text, sent_emo], regen_outs)
         regen_edit_btn.click(lambda t, i, x, e: on_regen(t, i, x, e, True), [take_state, sent_idx, sent_text, sent_emo], regen_outs)
+        pin_btn.click(on_pin, [take_state, sent_idx], [sent_hint, vinfo])
+        cand_btn.click(on_cands, [take_state, sent_idx, sent_text, sent_emo], [cand_group] + cand_audios + [sent_hint])
+        for k in range(3):
+            cand_picks[k].click(make_choose(k), [take_state, sent_idx], regen_outs + [cand_group])
+        unpin_btn.click(on_unpin, [voice], [vinfo])
+        tlang.change(on_tlang_change, [tlang, engine], [engine])
+        pron_save.click(on_save_dict, [pron], [pron_msg, pron])
         del_take.click(on_delete_take, [take_state], take_outs)
         open_btn2.click(open_outputs, None, None)
         cmp_btn.click(lambda: gr.update(open=True), None, [cmp_acc]).then(on_compare, [voice, text] + pv, cmp_outs)
@@ -1395,7 +1588,7 @@ def build_ui():
         # 🎧 试听
         pl_outs = [pl_page, pl_cur, pl_info]
         for k in range(PLAY_PAGE):
-            pl_outs += [pl_groups[k], pl_titles[k], pl_audios[k], pl_scores[k], pl_notes[k]]
+            pl_outs += [pl_groups[k], pl_titles[k], pl_audios[k], pl_scores[k], pl_notes[k], pl_autos[k]]
         pl_outs.append(pl_rank)
         pl_in = [pl_folder, pl_kw, pl_order]
         tab_play.select(lambda f: gr.update(choices=play_folders(), value=f or play_folders()[0][1]), [pl_folder], [pl_folder])
@@ -1406,6 +1599,8 @@ def build_ui():
         pl_prev.click(lambda f, k, o, p: play_render(f, k, o, (p or 1) - 1), pl_in + [pl_page], pl_outs)
         pl_next.click(lambda f, k, o, p: play_render(f, k, o, (p or 1) + 1), pl_in + [pl_page], pl_outs)
         pl_save.click(play_save, [pl_folder, pl_cur] + pl_scores + pl_notes, [pl_rank])
+        pl_auto_btn.click(play_auto, [pl_folder, pl_cur], pl_autos + [pl_auto_msg])
+        pl_cal_btn.click(play_calibrate, None, [pl_auto_msg])
 
         # ⑤ 管理
         m_refresh_outs = [ov, m_proj, m_target]

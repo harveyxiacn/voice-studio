@@ -21,10 +21,10 @@ WORKERS = {
 }
 ENGINE_NAMES = ["VoxCPM2", "CosyVoice3", "Qwen3-TTS", "GPT-SoVITS"]
 ENGINE_DESC = {
-    "VoxCPM2": "音色和语速最接近本人，48kHz 高音质（推荐）",
-    "CosyVoice3": "自然流畅、速度快，情感指令强",
+    "VoxCPM2": "最像本人，普通话/粤语都推荐；微调后效果最好",
+    "CosyVoice3": "普通话自然流畅；粤语口音不地道（不推荐）",
     "GPT-SoVITS": "省显存；需训练后才稳定，零样本粤语易漏字",
-    "Qwen3-TTS": "阿里通义 1.7B，普通话自然；官方不支持粤语",
+    "Qwen3-TTS": "普通话音色语调像；粤语口音不地道（不推荐）",
 }
 MODEL_FILES = {
     "VoxCPM2": os.path.join(ENG_DIR, "models", "VoxCPM2", "model.safetensors"),
@@ -130,7 +130,8 @@ def prepare(engine, voice, use_lora=True):
 
 
 def synth_sentence(engine, voice, emo, text, p, seed, out, use_lora=True):
-    """生成一句话到 out。p: 参数字典（lang_label, expr, speed, multi, strong）。返回 (用到的参考情感, 是否命中情感)。"""
+    """生成一句话到 out。p: 参数字典（lang_label, expr, speed, multi, strong）。
+    返回 (用到的参考情感, 是否命中情感, 参考录音文件名或 None)。text 应是已规范化的「朗读文字」。"""
     w = prepare(engine, voice, use_lora)
     text_lang = TEXT_LANGS[p["lang_label"]]
     if engine == "GPT-SoVITS":
@@ -139,7 +140,7 @@ def synth_sentence(engine, voice, emo, text, p, seed, out, use_lora=True):
         if not r.get("ok"):
             raise RuntimeError(r.get("error"))
         hit = "无此情感素材" not in r.get("report", "")
-        return (emo if hit else "平静"), hit
+        return (emo if hit else "平静"), hit, None
     ref, _aux, hit = Engine.pick_refs(voice, emo, text_lang, random.Random(seed))
     x = float(p["expr"])
     r = w.call({"cmd": "tts", "out": out, "pause": 0.0, "speed": float(p["speed"]), "seed": seed, "expr": x,
@@ -149,4 +150,4 @@ def synth_sentence(engine, voice, emo, text, p, seed, out, use_lora=True):
                            "ref_wav": os.path.join(voice["dir"], "refs", ref["file"]), "ref_text": ref["text"]}]})
     if not r.get("ok"):
         raise RuntimeError(r.get("error"))
-    return ref["emotion"], hit
+    return ref["emotion"], hit, ref["file"]

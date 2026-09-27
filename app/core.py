@@ -419,12 +419,12 @@ def sensevoice_ready():
     return os.path.exists(os.path.join(ROOT, "engines", "voxcpm_env", "Scripts", "python.exe")) and os.path.exists(SV_MODEL)
 
 
-def run_sensevoice(wav_dir, lang, log):
+def run_sensevoice(wav_dir, lang, log, device="cuda:0"):
     """SenseVoice 识别（带标点），返回 {文件名: {"text", "emotion", "lang"}}；不可用时返回空。"""
     if not sensevoice_ready():
         return {}
     out = wav_dir.rstrip("\\/") + "_sv.json"
-    code = run_cmd([os.path.join(ROOT, "engines", "sensevoice_asr.py"), wav_dir, out, "--lang", lang],
+    code = run_cmd([os.path.join(ROOT, "engines", "sensevoice_asr.py"), wav_dir, out, "--lang", lang, "--device", device],
                    lambda s: log("  [SenseVoice] " + s[-160:]) if ("rror" in s or "Traceback" in s) else None,
                    py=os.path.join(ROOT, "engines", "voxcpm_env", "Scripts", "python.exe"), cwd=os.path.join(ROOT, "engines"))
     res = {}
@@ -434,6 +434,22 @@ def run_sensevoice(wav_dir, lang, log):
         os.remove(out)
         for v in res.values():
             v["text"] = _NON_TEXT.sub("", v["text"]).strip()
+    return res
+
+
+def run_sensevoice_raw(wav_dir, lang, log, device="cuda:0"):
+    """评分用：不做数字转写的识别结果 {文件名: 文字}（「两千零二十六」保持汉字，才能和「二零二六」区分）。"""
+    if not sensevoice_ready():
+        return {}
+    out = wav_dir.rstrip("\\/") + f"_raw_{lang}.json"
+    code = run_cmd([os.path.join(ROOT, "engines", "sensevoice_asr.py"), wav_dir, out, "--lang", lang, "--device", device,
+                    "--no-itn"], lambda s: log("  [SenseVoice] " + s[-160:]) if ("rror" in s or "Traceback" in s) else None,
+                   py=os.path.join(ROOT, "engines", "voxcpm_env", "Scripts", "python.exe"), cwd=os.path.join(ROOT, "engines"))
+    res = {}
+    if code == 0 and os.path.exists(out):
+        with open(out, encoding="utf-8") as f:
+            res = {k: _NON_TEXT.sub("", v["text"]).strip() for k, v in json.load(f).items()}
+        os.remove(out)
     return res
 
 
@@ -1018,6 +1034,15 @@ def build_voice(proj, sovits=None, gpt=None, voxcpm_lora=None):
     if voxcpm_lora:
         shutil.rmtree(lora_dir, ignore_errors=True)
         shutil.copytree(voxcpm_lora, lora_dir)
+    # 用户锁定过的参考录音：只要素材还在，就一定保留在参考录音里
+    pinned = old.get("pinned") or {}
+    have = {s["file"] for s in refs}
+    by_file = {s["file"]: s for s in proj["segments"] if s["keep"] and s["text"].strip()}
+    for f in pinned.values():
+        if f not in have and f in by_file:
+            refs.append(by_file[f])
+            have.add(f)
+    pinned = {k: f for k, f in pinned.items() if f in have}
     for s in refs:
         shutil.copy(os.path.join(project_dir(vid), "slices", s["file"]), os.path.join(vdir, "refs", s["file"]))
     meta = {
@@ -1027,10 +1052,30 @@ def build_voice(proj, sovits=None, gpt=None, voxcpm_lora=None):
         "langs": sorted({s["lang"] for s in proj["segments"] if s["keep"]}),
         "refs": [{"file": s["file"], "text": s["text"], "lang": s["lang"], "emotion": s["emotion"], "dur": s["dur"]}
                  for s in refs],
+        "pinned": pinned,
     }
     with open(os.path.join(vdir, "voice.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
     return meta
+
+
+def _update_voice_json(vid, fn):
+    p = os.path.join(VOICES, vid, "voice.json")
+    with open(p, encoding="utf-8") as f:
+        v = json.load(f)
+    fn(v)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(v, f, ensure_ascii=False, indent=1)
+    return v
+
+
+def pin_ref(vid, lang, emotion, ref_file):
+    """锁定：这个语音包以后生成「lang + emotion」的句子都用 ref_file 作参考录音。"""
+    _update_voice_json(vid, lambda v: v.setdefault("pinned", {}).__setitem__(f"{lang}|{emotion}", ref_file))
+
+
+def unpin_all(vid):
+    _update_voice_json(vid, lambda v: v.__setitem__("pinned", {}))
 
 
 def gpu_info():

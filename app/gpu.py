@@ -89,21 +89,86 @@ def check_free(task, already_loaded=False):
     raise GpuBusy(msg)
 
 
+def _keep_awake(on):
+    """任务期间阻止 Windows 睡眠（实测：笔记本睡眠会让训练停住数小时）。显示器仍可关闭。"""
+    try:
+        import ctypes
+        ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | (ES_SYSTEM_REQUIRED if on else 0))
+    except Exception:
+        pass
+
+
+QUEUE_DIR = os.path.join(core.WORK, "_gpu_queue")
+os.makedirs(QUEUE_DIR, exist_ok=True)
+
+
+def queue():
+    """排队中的任务（先来先到）：[{"id","pid","task","since"}]；进程已退出的自动清除。"""
+    out = []
+    for fn in sorted(os.listdir(QUEUE_DIR)):
+        p = os.path.join(QUEUE_DIR, fn)
+        try:
+            with open(p, encoding="utf-8") as f:
+                q = json.load(f)
+        except Exception:
+            continue
+        if not _pid_alive(q.get("pid", 0)):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            continue
+        q["id"] = fn
+        out.append(q)
+    return out
+
+
+def cancel(qid=None):
+    """取消排队：指定 id 或取消本进程的全部排队。"""
+    for q in queue():
+        if qid in (None, q["id"]) and (qid or q["pid"] == os.getpid()):
+            open(os.path.join(QUEUE_DIR, q["id"] + ".cancel"), "w").close()
+
+
 @contextmanager
-def use(task):
-    """独占显卡。网页内的并发请求、以及命令行训练都会互相排斥。"""
-    h = holder()
-    if h and h.get("pid") != os.getpid():
-        mins = (time.time() - h.get("since", time.time())) / 60
-        raise GpuBusy(f"显卡正忙：{h.get('task')}（另一个窗口，已运行 {mins:.0f} 分钟），请等它完成后再试。")
-    if not _local.acquire(blocking=False):
-        h = holder() or {}
-        raise GpuBusy(f"显卡正忙：{h.get('task', '另一个任务')}，请等它完成后再试。")
+def use(task, wait=True, on_wait=None):
+    """独占显卡；显卡正忙时排队等待（先来先到，网页和命令行共用队列），轮到了自动开始。
+    wait=False 时不排队、直接报「显卡正忙」。on_wait(位置, 正在运行的任务) 用于显示排队进度。任务期间阻止系统睡眠。"""
+    def busy():
+        h = holder()
+        return h and h.get("pid") != os.getpid()
+
+    if not wait and busy():
+        raise GpuBusy(f"显卡正忙：{(holder() or {}).get('task')}，请等它完成后再试。")
+    qid = f"{time.time():.3f}_{os.getpid()}_{threading.get_ident()}.json"
+    qpath = os.path.join(QUEUE_DIR, qid)
+    with open(qpath, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "task": task, "since": time.time()}, f, ensure_ascii=False)
+    try:
+        while True:
+            if os.path.exists(qpath + ".cancel"):
+                raise GpuBusy("已取消排队")
+            q = queue()
+            pos = next((i for i, x in enumerate(q) if x["id"] == qid), 0) + 1
+            if pos == 1 and not busy() and _local.acquire(blocking=False):
+                break
+            if on_wait:
+                on_wait(pos, (holder() or {}).get("task") or (q[0]["task"] if q else ""))
+            time.sleep(2)
+    finally:
+        for p in (qpath, qpath + ".cancel"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
     try:
         with open(LOCK_FILE, "w", encoding="utf-8") as f:
             json.dump({"pid": os.getpid(), "task": task, "since": time.time()}, f, ensure_ascii=False)
+        _keep_awake(True)
         yield
     finally:
+        _keep_awake(False)
         try:
             os.remove(LOCK_FILE)
         except OSError:
@@ -115,4 +180,4 @@ def status():
     used, total = vram()
     h = holder()
     return {"used": used, "total": total, "task": h.get("task") if h else None,
-            "since": h.get("since") if h else None, "apps": heavy_apps()}
+            "since": h.get("since") if h else None, "apps": heavy_apps(), "queue": [q["task"] for q in queue()]}

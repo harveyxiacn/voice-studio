@@ -26,6 +26,11 @@ EMO_RULES = [
     ("开心", r"哈哈|太好了|开心|高兴|棒|耶|恭喜|好开心|谢谢|喜欢|好嘢|正呀|劲"),
     ("严肃", r"注意|必须|禁止|警告|严禁|务必|切记|请勿"),
 ]
+# 没有某种情感的参考录音时，按顺序找相近的情感（实测：「兴奋」句用「开心」录音比用「平静」录音像得多）
+SIMILAR_EMO = {
+    "兴奋": ["开心", "惊讶"], "开心": ["兴奋"], "惊讶": ["兴奋", "开心"], "温柔": ["平静", "悲伤"],
+    "悲伤": ["温柔"], "生气": ["严肃", "兴奋"], "严肃": ["平静", "生气"], "平静": ["温柔", "严肃"],
+}
 TAG_RE = re.compile(r"[\[【]\s*(" + "|".join(core.EMOTIONS) + r")\s*[\]】]")
 SENT_RE = re.compile(r"(?<=[。！？!?…~～\n])")
 
@@ -134,17 +139,18 @@ class Engine:
     @staticmethod
     def pick_refs(voice, emotion, text_lang, rng, max_dur=None):
         """挑参考录音。语言优先于情感（用普通话录音生成粤语会带口音）：
-        同语言同情感 → 同语言平静 → 同语言其他 → 其他语言同情感 → 其他。
-        voice.json 里的参考已按质量排序，只在最好的两条之间随机（让「重做」有变化）。"""
+        锁定的参考 → 同语言同情感 → 同语言相近情感（如 兴奋→开心）→ 同语言平静 → 同语言其他 → 其他语言同情感 → 其他。
+        voice.json 里的参考已按质量排序，只在最好的两条之间随机（让「重做」有变化）；锁定的参考固定使用。"""
         refs = [r for r in voice["refs"] if not max_dur or r["dur"] <= max_dur] or voice["refs"]
         want = "yue" if "yue" in text_lang else ("zh" if text_lang in ("zh", "auto") else "en")
-        tiers = [
-            [r for r in refs if r["lang"] == want and r["emotion"] == emotion],
-            [r for r in refs if r["lang"] == want and r["emotion"] == "平静"],
-            [r for r in refs if r["lang"] == want],
-            [r for r in refs if r["emotion"] == emotion],
-            refs,
-        ]
+        pinned = (voice.get("pinned") or {}).get(f"{want}|{emotion}")
+        pin = [r for r in refs if r["file"] == pinned]
+        if pin:
+            return pin[0], [r for r in refs if r["lang"] == want and r["emotion"] == pin[0]["emotion"] and r is not pin[0]][:3], True
+        same = [r for r in refs if r["lang"] == want]
+        tiers = [[r for r in same if r["emotion"] == emotion]]
+        tiers += [[r for r in same if r["emotion"] == e] for e in SIMILAR_EMO.get(emotion, [])]
+        tiers += [[r for r in same if r["emotion"] == "平静"], same, [r for r in refs if r["emotion"] == emotion], refs]
         c = next(t for t in tiers if t)
         first = c[rng.randrange(min(2, len(c)))]
         aux = [r for r in c if r is not first][:3]

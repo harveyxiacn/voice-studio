@@ -14,7 +14,8 @@ import numpy as np
 
 import core
 import engines as ENG
-from tts_engine import split_sentences
+import textnorm
+from tts_engine import TEXT_LANGS, split_sentences
 
 TAKES = os.path.join(core.OUTPUTS, "_takes")
 os.makedirs(TAKES, exist_ok=True)
@@ -89,6 +90,11 @@ def _sub_lines(text):
     return [re.sub(r"[，,、；;：:]\s*", " ", l.strip().rstrip(TRAIL_PUNCT)).strip() or l.strip() for l in lines]
 
 
+def _lang(meta_or_params):
+    p = meta_or_params.get("params", meta_or_params)
+    return "yue" if "yue" in TEXT_LANGS.get(p["lang_label"], "zh") else "zh"
+
+
 def _weight(s):
     return max(1, len(re.sub(r"[^\w]", "", s)))
 
@@ -149,9 +155,11 @@ def create(engine, vid, text, params, log=lambda m: None):
         for i, (emo, s) in enumerate(sents):
             f = f"s{i + 1:03d}.wav"
             log(f"第 {i + 1}/{len(sents)} 句【{emo}】{s[:20]}")
-            used, hit = ENG.synth_sentence(engine, voice, emo, s, params, seed + i, os.path.join(_dir(tid), f),
-                                           params.get("use_lora", True))
-            meta["sentences"].append({"text": s, "emotion": emo, "file": f, "seed": seed + i, "ref_emotion": used, "hit": hit})
+            say = textnorm.spoken(s, _lang(params))  # 朗读文字（数字读法、发音词典）；字幕仍用原文
+            used, hit, ref = ENG.synth_sentence(engine, voice, emo, say, params, seed + i, os.path.join(_dir(tid), f),
+                                                params.get("use_lora", True))
+            meta["sentences"].append({"text": s, "spoken": say, "emotion": emo, "file": f, "seed": seed + i,
+                                      "ref_emotion": used, "hit": hit, "ref": ref})
     except Exception:
         shutil.rmtree(_dir(tid), ignore_errors=True)
         raise
@@ -170,13 +178,60 @@ def regen(tid, idx, text=None, emotion=None, seed=None):
     s["seed"] = int(seed) if seed is not None and int(seed) >= 0 else random.randint(0, 2 ** 31 - 1)
     voice = core.load_voice(meta["vid"])
     new = f"s{idx + 1:03d}_{int(time.time()) % 100000}.wav"
-    used, hit = ENG.synth_sentence(meta["engine"], voice, s["emotion"], s["text"], meta["params"], s["seed"],
-                                   os.path.join(_dir(tid), new), meta["params"].get("use_lora", True))
+    s["spoken"] = textnorm.spoken(s["text"], _lang(meta))
+    used, hit, ref = ENG.synth_sentence(meta["engine"], voice, s["emotion"], s["spoken"], meta["params"], s["seed"],
+                                        os.path.join(_dir(tid), new), meta["params"].get("use_lora", True))
     try:
         os.remove(os.path.join(_dir(tid), s["file"]))
     except OSError:
         pass
-    s.update(file=new, ref_emotion=used, hit=hit)
+    s.update(file=new, ref_emotion=used, hit=hit, ref=ref)
+    return build(meta)
+
+
+def candidates(tid, idx, n=3, text=None, emotion=None):
+    """为第 idx 句生成 n 个候选（不同随机种子），由用户试听后挑选。不改动当前作品，直到 choose()。
+    说明：实测声纹相似度与人耳评分几乎不相关（秩相关 -0.03~0.47），所以不做自动挑选，交给人耳。"""
+    meta = load(tid)
+    s = meta["sentences"][idx]
+    text = text.strip() if text and text.strip() else s["text"]
+    emotion = emotion or s["emotion"]
+    say = textnorm.spoken(text, _lang(meta))
+    voice = core.load_voice(meta["vid"])
+    stamp = int(time.time()) % 100000
+    cands = []
+    for k in range(n):
+        seed = random.randint(0, 2 ** 31 - 1)
+        f = f"s{idx + 1:03d}_c{k + 1}_{stamp}.wav"
+        used, hit, ref = ENG.synth_sentence(meta["engine"], voice, emotion, say, meta["params"], seed,
+                                            os.path.join(_dir(tid), f), meta["params"].get("use_lora", True))
+        cands.append({"file": f, "seed": seed, "text": text, "spoken": say, "emotion": emotion,
+                      "ref": ref, "ref_emotion": used, "hit": hit})
+    meta.setdefault("candidates", {})[str(idx)] = cands
+    _save(meta)
+    return [os.path.join(_dir(tid), c["file"]) for c in cands]
+
+
+def choose(tid, idx, k):
+    """用第 k 个候选替换第 idx 句，其余候选删除，重新拼接整段和字幕。"""
+    meta = load(tid)
+    cands = (meta.get("candidates") or {}).get(str(idx)) or []
+    if k >= len(cands):
+        raise ValueError("候选不存在，请重新生成候选")
+    c = cands[k]
+    s = meta["sentences"][idx]
+    try:
+        os.remove(os.path.join(_dir(tid), s["file"]))
+    except OSError:
+        pass
+    for j, o in enumerate(cands):
+        if j != k:
+            try:
+                os.remove(os.path.join(_dir(tid), o["file"]))
+            except OSError:
+                pass
+    s.update({key: c[key] for key in ("file", "seed", "text", "spoken", "emotion", "ref", "ref_emotion", "hit")})
+    meta["candidates"].pop(str(idx), None)
     return build(meta)
 
 
@@ -189,7 +244,9 @@ def table(meta):
     rows = []
     for i, s in enumerate(meta["sentences"]):
         emo = s["emotion"] + ("" if s.get("hit", True) else f"（用{s.get('ref_emotion', '平静')}录音）")
-        rows.append([i + 1, emo, s["text"], s.get("dur", 0), f"{s.get('start', 0):.1f}s"])
+        say = s.get("spoken")
+        txt = s["text"] + (f"（读作：{say}）" if say and say != s["text"] else "")
+        rows.append([i + 1, emo, txt, s.get("dur", 0), f"{s.get('start', 0):.1f}s"])
     return rows
 
 

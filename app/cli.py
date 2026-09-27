@@ -66,6 +66,16 @@ def make_progress():
     return progress
 
 
+def _wait_msg():
+    last = {"pos": None}
+
+    def f(pos, cur):
+        if last["pos"] != pos:
+            last["pos"] = pos
+            log(f"⏳ 显卡正忙（{cur}），排队中：第 {pos} 位，轮到后自动开始（Ctrl+C 可取消）")
+    return f
+
+
 def run(proj, engine, iters=None, e_sovits=8, e_gpt=15, bs=4):
     import gpu
     st = core.project_stats(proj)
@@ -78,14 +88,14 @@ def run(proj, engine, iters=None, e_sovits=8, e_gpt=15, bs=4):
         log("已生成语音包（零样本）")
     try:
         if engine in ("voxcpm", "all"):
-            with gpu.use("VoxCPM2 微调（命令行）"):
+            with gpu.use("VoxCPM2 微调（命令行）", on_wait=_wait_msg()):
                 gpu.check_free("VoxCPM2 微调")
                 iters = iters or core.suggest_voxcpm_iters(st["sec"])
                 lora = core.train_voxcpm(proj, iters, log, make_progress())
                 core.build_voice(core.load_project(proj["id"]), voxcpm_lora=lora)
             log(f"✅ VoxCPM2 微调完成（累计 {(time.time() - t0) / 60:.1f} 分钟）")
         if engine in ("sovits", "all"):
-            with gpu.use("GPT-SoVITS 训练（命令行）"):
+            with gpu.use("GPT-SoVITS 训练（命令行）", on_wait=_wait_msg()):
                 gpu.check_free("GPT-SoVITS 训练")
                 sovits, gpt = core.train(core.load_project(proj["id"]), e_sovits, e_gpt, bs, log, make_progress())
                 core.build_voice(core.load_project(proj["id"]), sovits, gpt)
