@@ -1,0 +1,24 @@
+# 白名单模式：默认忽略一切，只放行程序代码和文档。
+# 目的：防止把声音、录音、图片、语音包、模型、训练数据、运行环境等隐私或大文件提交到仓库。
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/使用说明.md
+!/设计说明.md
+!/install.ps1
+!/安装.bat
+!/启动声音工坊.bat
+!/训练.bat
+
+!/app/
+/app/*
+!/app/*.py
+
+!/engines/
+/engines/*
+!/engines/*.py
+!/engines/build_constraints.txt
+
+__pycache__/
+*.pyc
